@@ -1,4 +1,4 @@
-name: Build & Release (Cython)
+name: Release
 
 on:
   push:
@@ -10,47 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.11', '3.12']
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install build dependencies
-        run: pip install cython setuptools
-
-      - name: Compile with Cython
-        run: python setup.py build_ext --inplace
-
-      - name: Package release
-        run: |
-          mkdir -p dist/app/proxy
-
-          # Copy compiled .so binaries (root modules)
-          find . -maxdepth 1 -name "*.so" -exec cp {} dist/app/ \;
-
-          # Copy compiled .so binaries (proxy package)
-          find proxy/ -name "*.so" -exec cp {} dist/app/proxy/ \;
-
-          # Thin launcher — compiled main.so is imported as 'main'
-          printf 'import asyncio\nfrom main import main\nasyncio.run(main())\n' > dist/app/run.py
-
-          # Non-Python assets
-          cp config.yaml requirements.txt Dockerfile docker-compose.yml README.md dist/app/
-          cp -r filters/ dist/app/filters/
-
       - name: Create release archive
-        run: zip -r proxy-app-v2-${{ github.ref_name }}-py${{ matrix.python-version }}.zip dist/app/
+        run: zip -r proxy-app-v2-${{ github.ref_name }}.zip . -x "*.git*" -x "__pycache__/*" -x "*.pyc" -x "logs/*" -x "certs/*" -x ".pytest_cache/*" -x "dist/*"
 
-      - name: Upload to GitHub Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: proxy-app-v2-${{ github.ref_name }}-py${{ matrix.python-version }}.zip
+          files: proxy-app-v2-${{ github.ref_name }}.zip
           generate_release_notes: true
