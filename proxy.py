@@ -73,6 +73,7 @@ class JARVISProxy:
         # DNS cache
         self.dns_cache: Dict[str, Tuple[DNSInfo, float]] = {}
         self.dns_cache_ttl = 300
+        self._dns_pending: Dict[str, asyncio.Future] = {}  # deduplicates in-flight lookups
 
         # Bandwidth throttling
         self.bandwidth_limit = 0
@@ -415,16 +416,23 @@ class JARVISProxy:
         asyncio.create_task(self.db.log_request(metrics))
 
     async def resolve_host(self, host: str) -> DNSInfo:
-        """Resolve hostname to IP addresses with caching"""
+        """Resolve hostname to IP addresses with caching and in-flight deduplication."""
         if host in self.dns_cache:
             info, timestamp = self.dns_cache[host]
             if time.time() - timestamp < self.dns_cache_ttl:
                 info.cached = True
                 return info
 
+        # Deduplicate concurrent lookups for the same host
+        if host in self._dns_pending:
+            return await asyncio.shield(self._dns_pending[host])
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._dns_pending[host] = fut
+
         start = time.time()
         try:
-            loop = asyncio.get_running_loop()
             infos = await asyncio.wait_for(
                 loop.getaddrinfo(host, None, family=socket.AF_UNSPEC),
                 timeout=5.0
@@ -442,13 +450,19 @@ class JARVISProxy:
             )
 
             self.dns_cache[host] = (dns_info, time.time())
-
+            fut.set_result(dns_info)
             return dns_info
 
         except asyncio.TimeoutError:
-            raise Exception(f"DNS resolution timeout for {host}")
+            exc = Exception(f"DNS resolution timeout for {host}")
+            fut.set_exception(exc)
+            raise exc
         except socket.gaierror as e:
-            raise Exception(f"DNS resolution failed for {host}: {e}")
+            exc = Exception(f"DNS resolution failed for {host}: {e}")
+            fut.set_exception(exc)
+            raise exc
+        finally:
+            self._dns_pending.pop(host, None)
 
     async def pipe_stream(
         self,
@@ -1622,6 +1636,7 @@ class JARVISProxy:
             self.port,
             reuse_address=True,
             reuse_port=True,
+            limit=262144,  # 256 KB StreamReader buffer (default is 64 KB)
         )
 
         # Start web UI (accessible from any device on the LAN)

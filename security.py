@@ -1,7 +1,7 @@
 import re
 import time
 from typing import Dict, List, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from models import SecurityLevel, ContentType
 from config import get as cfg_get
@@ -11,16 +11,19 @@ class SecurityAnalyzer:
     """Advanced security analysis and threat detection"""
 
     def __init__(self):
-        self.malicious_patterns = [
-            r'<script[^>]*>.*?</script>',
-            r'javascript:',
-            r'onerror\s*=',
-            r'onclick\s*=',
-            r'\.\./\.\.',
-            r'union\s+select',
-            r'drop\s+table',
-            r'exec\s*\(',
-            r'eval\s*\(',
+        # Precompiled for zero per-request compilation overhead
+        self._malicious_patterns = [
+            re.compile(p, re.IGNORECASE) for p in [
+                r'<script[^>]*>.*?</script>',
+                r'javascript:',
+                r'onerror\s*=',
+                r'onclick\s*=',
+                r'\.\./\.\.',
+                r'union\s+select',
+                r'drop\s+table',
+                r'exec\s*\(',
+                r'eval\s*\(',
+            ]
         ]
 
         self.malicious_domains = {
@@ -29,7 +32,7 @@ class SecurityAnalyzer:
 
         self.suspicious_tlds = {'.tk', '.ml', '.ga', '.cf', '.gq'}
 
-        self.rate_limits: Dict[str, List[float]] = defaultdict(list)
+        self.rate_limits: Dict[str, deque] = defaultdict(deque)
         self.rate_limit_window = cfg_get("security", "rate_limit_window", 6000)
         self.rate_limit_max    = cfg_get("security", "rate_limit_max",    100000)
 
@@ -41,9 +44,9 @@ class SecurityAnalyzer:
         if any(host.endswith(tld) for tld in self.suspicious_tlds):
             return SecurityLevel.SUSPICIOUS, "Suspicious TLD"
 
-        for pattern in self.malicious_patterns:
-            if re.search(pattern, url, re.IGNORECASE):
-                return SecurityLevel.SUSPICIOUS, f"Suspicious pattern: {pattern}"
+        for pat in self._malicious_patterns:
+            if pat.search(url):
+                return SecurityLevel.SUSPICIOUS, f"Suspicious pattern: {pat.pattern}"
 
         if len(url) > 2000:
             return SecurityLevel.SUSPICIOUS, "Unusually long URL"
@@ -53,16 +56,17 @@ class SecurityAnalyzer:
     def check_rate_limit(self, client_ip: str) -> bool:
         """Check if client exceeds rate limit"""
         now = time.time()
+        window = self.rate_limits[client_ip]
 
-        self.rate_limits[client_ip] = [
-            t for t in self.rate_limits[client_ip]
-            if now - t < self.rate_limit_window
-        ]
+        # Drop expired entries from the front in O(1) amortised
+        cutoff = now - self.rate_limit_window
+        while window and window[0] <= cutoff:
+            window.popleft()
 
-        if len(self.rate_limits[client_ip]) >= self.rate_limit_max:
+        if len(window) >= self.rate_limit_max:
             return False
 
-        self.rate_limits[client_ip].append(now)
+        window.append(now)
         return True
 
     def analyze_headers(self, headers: Dict[str, str]) -> Tuple[SecurityLevel, str]:

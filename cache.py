@@ -110,18 +110,19 @@ class AdvancedCache:
     async def get(
         self, method: str, url: str, headers: Dict[str, str]
     ) -> Optional[CacheEntry]:
-        """Return a fresh cache entry or None."""
-        async with self.lock:
-            key = self._make_key(method, url, headers)
-            entry = self.cache.get(key)
-            if entry is None:
-                return None
-            if time.time() - entry.timestamp >= entry.ttl:
-                del self.cache[key]
-                return None
-            entry.hit_count += 1
-            entry.last_access = time.time()
-            return entry
+        """Return a fresh cache entry or None (lockless read — CPython dict reads are GIL-safe)."""
+        key = self._make_key(method, url, headers)
+        entry = self.cache.get(key)
+        if entry is None:
+            return None
+        if time.time() - entry.timestamp >= entry.ttl:
+            # Best-effort eviction — lock only for the removal
+            async with self.lock:
+                self.cache.pop(key, None)
+            return None
+        entry.hit_count += 1
+        entry.last_access = time.time()
+        return entry
 
     async def set(
         self,
