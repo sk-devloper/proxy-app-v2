@@ -50,7 +50,7 @@ filter:
 
 logging:
   level: "DEBUG"
-  format: "text"           # "text" (default) | "json" for structured/ELK-compatible output
+  format: "json"           # "text" (default) | "json" for structured/ELK-compatible output
   max_bytes: 10485760      # 10 MB per log file before rotation
   backup_count: 5          # number of rotated backups to keep
   files:
