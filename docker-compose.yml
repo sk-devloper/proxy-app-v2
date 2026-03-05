@@ -1,0 +1,16 @@
+services:
+  jarvis-proxy:
+    build: .
+    container_name: jarvis-proxy
+    ports:
+      - "8888:8888"
+      - "8890:8890"
+    volumes:
+      - ./logs:/app/logs
+      - ./certs:/app/certs
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+    # Allocate a TTY so the Rich TUI renders correctly.
+    # Remove tty/stdin_open if running headless (no dashboard needed).
+    tty: true
+    stdin_open: true

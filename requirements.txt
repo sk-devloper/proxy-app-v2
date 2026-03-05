@@ -1,0 +1,13 @@
+# J.A.R.V.I.S. Proxy dependencies
+rich>=13.0.0
+pyyaml>=6.0
+aiohttp
+requests
+textual
+PyQt6
+
+# Optional: for SSL MITM inspection
+cryptography>=41.0.0
+
+# Optional: for real GeoIP lookups (requires GeoLite2-City.mmdb from MaxMind)
+# geoip2>=4.0.0

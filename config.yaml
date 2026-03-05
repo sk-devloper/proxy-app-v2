@@ -1,0 +1,76 @@
+proxy:
+  host: "0.0.0.0"
+  port: 8888
+  ssl_inspection: true
+  max_connections: 5000        # semaphore cap on simultaneous connections
+  connect_timeout: 90.0       # seconds to establish upstream TCP/SSL
+  read_timeout: 100.0          # seconds to read client request headers
+  body_timeout: 600.0          # seconds per read() call while streaming response body
+  auth_user: ""                # proxy Basic auth username — leave empty to disable
+  auth_pass: ""                # proxy Basic auth password
+  upstream_proxy: ""           # chain through upstream proxy e.g. "corporate.lan:3128"
+
+cache:
+  max_size: 10000
+  ttl: 36000
+
+geoip:
+  provider: "ip-api"   # "ip-api" or "mock"
+  rate_limit: 45        # max requests per minute (ip-api.com free limit)
+
+security:
+  rate_limit_window: 6000
+  rate_limit_max: 100000
+  # CIDR-based client IP allowlist (if non-empty, only listed IPs can use proxy)
+  client_allowlist: []    # e.g. ["192.168.1.0/24", "10.0.0.0/8"]
+  # CIDR-based client IP denylist (ignored if allowlist is non-empty)
+  client_denylist: []     # e.g. ["1.2.3.0/24"]
+
+database:
+  path: "logs/jarvis.db"
+
+web_ui:
+  port: 8890          # dashboard accessible from any LAN device at http://<host>:8890
+  token: ""           # set a string to require Bearer/X-API-Key auth on all /api/* routes
+
+health:
+  port: 0             # set e.g. 9090 to enable /health endpoint; 0 = disabled
+
+alerting:
+  webhook_url: "https://discord.com/api/webhooks/1479175905346850986/ZawGyWlH1a3PTRHBK4FSQN9qWuQ8Dey4NJmA4OGNYnCJKhbsPpZN26_Cs9dydEvn2_Br"     # Discord/Slack/generic POST URL — empty = disabled
+  min_level: "suspicious"  # suspicious | malicious | blocked
+  retry_count: 3
+
+filter:
+  blocklist_file: "filters/blocklist.txt"   # easy-to-edit domain blocklist
+  allowlist_file: "filters/allowlist.txt"   # always-allowed domains (overrides blocklist)
+  reload_interval: 60                        # seconds between hot-reloads of filter files
+  whitelist_mode: false                      # true = only allow domains in allowlist
+  bypass_domains: []                         # extra bypass domains (in addition to allowlist file)
+
+logging:
+  level: "DEBUG"
+  format: "text"           # "text" (default) | "json" for structured/ELK-compatible output
+  max_bytes: 10485760      # 10 MB per log file before rotation
+  backup_count: 5          # number of rotated backups to keep
+  files:
+    main:        "logs/jarvis.log"
+    access:      "logs/access.log"
+    error:       "logs/error.log"
+    security:    "logs/security.log"
+    performance: "logs/performance.log"
+
+# Header rewrite rules applied to every proxied request/response
+rewrite:
+  request:
+    - {header: "X-Forwarded-For", action: remove}   # strip client IP leakage
+  response:
+    - {header: "Server", action: remove}             # hide server fingerprint
+    - {header: "X-Powered-By", action: remove}
+
+# Per-IP bandwidth throttling (first CIDR match wins; 0 bps = unlimited)
+bandwidth:
+  rules: []
+  # Examples:
+  #   - {cidr: "10.0.0.0/8",  bps: 5242880}   # 5 MB/s for LAN
+  #   - {cidr: "0.0.0.0/0",   bps: 1048576}   # 1 MB/s for everyone else

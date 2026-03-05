@@ -1,0 +1,47 @@
+# ============================================================
+# J.A.R.V.I.S. Proxy — Allow List  (bypass / whitelist)
+# ============================================================
+# Format: same as blocklist.txt
+#
+# Entries here OVERRIDE the blocklist — if a host matches
+# both lists, it is ALLOWED through.
+#
+# Use this to whitelist specific subdomains from a blocked
+# parent domain, or to mark trusted sites when whitelist
+# mode is enabled.
+# ============================================================
+
+# ── Social Media ─────────────────────────────────────────────────────────────
+instagram.com
+cdninstagram.com
+facebook.com
+fbcdn.net
+messenger.com
+whatsapp.com
+whatsapp.net
+tiktok.com
+tiktokcdn.com
+tiktokv.com
+muscdn.com
+
+# ── Streaming ────────────────────────────────────────────────────────────────
+youtube.com
+googlevideo.com
+ytimg.com
+netflix.com
+nflxvideo.net
+nflxext.com
+twitch.tv
+twitchsvc.net
+
+# ── CDNs / Infrastructure (commonly needed by social apps) ───────────────────
+akamaized.net
+akamaihd.net
+cloudfront.net
+fastly.net
+edgecastcdn.net
+llnwd.net
+gstatic.com
+googleapis.com
+
+# ── Your trusted sites (add below) ───────────────────────────────────────────

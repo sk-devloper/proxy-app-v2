@@ -1,0 +1,48 @@
+# ============================================================
+# J.A.R.V.I.S. Proxy — Block List
+# ============================================================
+# Format:
+#   example.com          — blocks example.com AND all subdomains
+#   *.example.com        — same as above (leading *. is stripped)
+#   regex:.*\.spy\..*    — full regex match against the hostname
+#
+# Blank lines and lines starting with # are ignored.
+# Inline comments are supported:  ads.com  # blocks ad network
+#
+# Changes are picked up automatically every 60 seconds — no restart needed.
+# ============================================================
+
+# ── Advertising & Tracking ────────────────────────────────────────────────────
+doubleclick.net
+googleadservices.com
+googlesyndication.com
+adnxs.com
+adsrvr.org
+ads.yahoo.com
+ads.facebook.com
+advertising.com
+adzerk.net
+moatads.com
+scorecardresearch.com
+quantserve.com
+taboola.com
+outbrain.com
+criteo.com
+rubiconproject.com
+pubmatic.com
+openx.net
+casalemedia.com
+lijit.com
+adroll.com
+
+# ── Tracking / Analytics (add/remove as needed) ───────────────────────────────
+# google-analytics.com      # commented out — many sites need this to function
+# segment.com               # same
+# mixpanel.com              # same
+
+# ── Malware / Phishing ────────────────────────────────────────────────────────
+malware.com
+phishing.net
+scam.org
+
+# ── Custom blocks (add your own below) ───────────────────────────────────────

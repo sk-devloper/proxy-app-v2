@@ -1,0 +1,54 @@
+name: Build & Release (Obfuscated)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyArmor
+        run: pip install pyarmor
+
+      - name: Obfuscate source
+        run: |
+          mkdir -p dist/app
+
+          # Obfuscate all root-level Python modules and the proxy package in one pass
+          pyarmor gen -O dist/app -r \
+            $(find . -maxdepth 1 -name "*.py" | sort | tr '\n' ' ') \
+            proxy/
+
+      - name: Copy non-Python assets
+        run: |
+          cp config.yaml dist/app/
+          cp requirements.txt dist/app/
+          cp Dockerfile dist/app/
+          cp docker-compose.yml dist/app/
+          cp README.md dist/app/
+          cp -r filters/ dist/app/filters/
+
+      - name: Package release archive
+        run: |
+          cd dist
+          zip -r ../proxy-app-v2-${{ github.ref_name }}.zip app/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: proxy-app-v2-${{ github.ref_name }}.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

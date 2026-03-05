@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# PyArmor
+.pyarmor/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Pytest
+.pytest_cache/
+
+# Logs
+logs/
+*.log
+
+# SSL certs (keep your own certs out of source control)
+certs/*.pem
+certs/*.key
+certs/*.crt
+certs/*.der
+
+# GeoIP database (too large, download separately)
+*.mmdb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
