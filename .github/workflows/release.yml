@@ -1,4 +1,4 @@
-name: Build & Release (Obfuscated)
+name: Build & Release (Cython)
 
 on:
   push:
@@ -20,31 +20,35 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install PyArmor
-        run: pip install pyarmor
+      - name: Install build dependencies
+        run: pip install cython setuptools
 
-      - name: Obfuscate source
+      - name: Compile with Cython
+        run: python setup.py build_ext --inplace
+
+      - name: Package release
         run: |
-          mkdir -p dist/app
+          mkdir -p dist/app/proxy
 
-          # Obfuscate all root-level Python modules and the proxy package in one pass
-          pyarmor gen -O dist/app -r \
-            $(find . -maxdepth 1 -name "*.py" | sort | tr '\n' ' ') \
-            proxy/
+          # Copy compiled .so binaries (root modules)
+          find . -maxdepth 1 -name "*.so" -exec cp {} dist/app/ \;
 
-      - name: Copy non-Python assets
-        run: |
-          cp config.yaml dist/app/
-          cp requirements.txt dist/app/
-          cp Dockerfile dist/app/
-          cp docker-compose.yml dist/app/
-          cp README.md dist/app/
+          # Copy compiled .so binaries (proxy package)
+          find proxy/ -name "*.so" -exec cp {} dist/app/proxy/ \;
+
+          # Thin launcher — compiled main.so is imported as 'main'
+          cat > dist/app/run.py << 'EOF'
+import asyncio
+from main import main
+asyncio.run(main())
+EOF
+
+          # Non-Python assets
+          cp config.yaml requirements.txt Dockerfile docker-compose.yml README.md dist/app/
           cp -r filters/ dist/app/filters/
 
-      - name: Package release archive
-        run: |
-          cd dist
-          zip -r ../proxy-app-v2-${{ github.ref_name }}.zip app/
+      - name: Create release archive
+        run: zip -r proxy-app-v2-${{ github.ref_name }}.zip dist/app/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
