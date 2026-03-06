@@ -1,0 +1,252 @@
+openapi: "3.1.0"
+info:
+  title: "J.A.R.V.I.S. Proxy Management API"
+  description: |
+    Runtime management REST API for the J.A.R.V.I.S. proxy.
+    All mutating endpoints require a Bearer token or X-API-Key header if
+    `web_ui.token` is set in config.yaml.
+  version: "1.0.0"
+  license:
+    name: MIT
+
+servers:
+  - url: "http://localhost:8890"
+    description: "Default web UI port"
+
+components:
+  securitySchemes:
+    BearerToken:
+      type: http
+      scheme: bearer
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    DomainList:
+      type: object
+      properties:
+        domains:
+          type: array
+          items: { type: string }
+        count:
+          type: integer
+    DomainBody:
+      type: object
+      properties:
+        domains:
+          type: array
+          items: { type: string }
+        domain:
+          type: string
+          description: "Single domain (alternative to 'domains' array)"
+    BandwidthRule:
+      type: object
+      required: [cidr, bps]
+      properties:
+        cidr:   { type: string, example: "10.0.0.0/8" }
+        bps:    { type: integer, description: "Bytes per second; 0 = unlimited" }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+security:
+  - BearerToken: []
+  - ApiKey: []
+
+paths:
+  /api/stats:
+    get:
+      summary: Live proxy statistics (SSE snapshot)
+      security: []
+      responses:
+        "200": { description: JSON stats object }
+
+  /metrics:
+    get:
+      summary: Prometheus-format metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus text format
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /api/v1/status:
+    get:
+      summary: High-level health/status
+      responses:
+        "200": { description: JSON status object }
+
+  /api/v1/cache/flush:
+    post:
+      summary: Flush the entire response cache
+      responses:
+        "204": { description: Cache flushed }
+
+  /api/v1/har:
+    get:
+      summary: Export request history as HAR 1.2 file
+      responses:
+        "200": { description: HAR export path }
+
+  /api/v1/blocklist:
+    get:
+      summary: List all blocked domains
+      responses:
+        "200":
+          description: Domain list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DomainList" }
+    post:
+      summary: Add one or more blocked domains
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DomainBody" }
+      responses:
+        "201": { description: Domains added }
+        "400":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/blocklist/{domain}:
+    delete:
+      summary: Remove a blocked domain
+      parameters:
+        - in: path
+          name: domain
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Domain removed }
+
+  /api/v1/allowlist:
+    get:
+      summary: List all bypass/allowed domains
+      responses:
+        "200":
+          description: Domain list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DomainList" }
+    post:
+      summary: Add one or more bypass domains
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DomainBody" }
+      responses:
+        "201": { description: Domains added }
+
+  /api/v1/allowlist/{domain}:
+    delete:
+      summary: Remove a bypass domain
+      parameters:
+        - in: path
+          name: domain
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Domain removed }
+
+  /api/v1/filters:
+    get:
+      summary: Get current filter settings
+      responses:
+        "200":
+          description: Filter config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  whitelist_mode:         { type: boolean }
+                  blocked_count:          { type: integer }
+                  allowed_count:          { type: integer }
+                  blocked_content_types:  { type: array, items: { type: string } }
+    patch:
+      summary: Update filter settings at runtime
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                whitelist_mode:        { type: boolean }
+                blocked_content_types: { type: array, items: { type: string } }
+      responses:
+        "204": { description: Updated }
+
+  /api/v1/security:
+    get:
+      summary: Get security configuration
+      responses:
+        "200":
+          description: Security config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  force_https:          { type: boolean }
+                  client_allowlist:     { type: array, items: { type: string } }
+                  client_denylist:      { type: array, items: { type: string } }
+                  anomaly_enabled:      { type: boolean }
+                  anomaly_threshold_rps: { type: integer }
+    patch:
+      summary: Update security settings at runtime
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force_https:      { type: boolean }
+                client_allowlist: { type: array, items: { type: string } }
+                client_denylist:  { type: array, items: { type: string } }
+      responses:
+        "204": { description: Updated }
+
+  /api/v1/bandwidth:
+    get:
+      summary: List bandwidth throttle rules
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rules:
+                    type: array
+                    items: { $ref: "#/components/schemas/BandwidthRule" }
+    post:
+      summary: Add a bandwidth rule (prepended, highest priority)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BandwidthRule" }
+      responses:
+        "201": { description: Rule added }
+    delete:
+      summary: Remove a bandwidth rule by CIDR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cidr]
+              properties:
+                cidr: { type: string }
+      responses:
+        "204": { description: Rule removed }

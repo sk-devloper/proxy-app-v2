@@ -6,21 +6,33 @@ proxy:
   connect_timeout: 90.0       # seconds to establish upstream TCP/SSL
   read_timeout: 100.0          # seconds to read client request headers
   body_timeout: 600.0          # seconds per read() call while streaming response body
+  dns_cache_ttl: 300           # seconds to cache resolved DNS entries
   auth_user: ""                # proxy Basic auth username — leave empty to disable
   auth_pass: ""                # proxy Basic auth password
   upstream_proxy: ""           # chain through upstream proxy e.g. "corporate.lan:3128"
 
 cache:
+  backend: memory         # "memory" (default) | "redis"
   max_size: 10000
   ttl: 36000
+  # Redis settings (only used when backend: redis)
+  redis_url: "redis://localhost:6379/0"
+  redis_prefix: "jarvis:cache:"
 
 geoip:
   provider: "ip-api"   # "ip-api" or "mock"
   rate_limit: 45        # max requests per minute (ip-api.com free limit)
 
+dns:
+  doh_enabled: false              # set true to use DNS-over-HTTPS
+  doh_provider: "cloudflare"      # "cloudflare" | "google" | custom URL
+  doh_timeout: 5.0
+  cache_ttl: 300                  # DNS cache TTL in seconds
+
 security:
   rate_limit_window: 6000
   rate_limit_max: 100000
+  force_https: false            # redirect plain HTTP requests to HTTPS with 307
   # CIDR-based client IP allowlist (if non-empty, only listed IPs can use proxy)
   client_allowlist: []    # e.g. ["192.168.1.0/24", "10.0.0.0/8"]
   # CIDR-based client IP denylist (ignored if allowlist is non-empty)
@@ -32,9 +44,19 @@ database:
 web_ui:
   port: 8890          # dashboard accessible from any LAN device at http://<host>:8890
   token: ""           # set a string to require Bearer/X-API-Key auth on all /api/* routes
+  tls:
+    enabled: false    # set true to serve dashboard over HTTPS
+    cert: ""          # path to PEM cert file (leave empty to use proxy CA cert)
+    key: ""           # path to PEM key file
 
 health:
-  port: 0             # set e.g. 9090 to enable /health endpoint; 0 = disabled
+  port: 0             # set e.g. 9090 to enable /health and /metrics endpoints; 0 = disabled
+
+anomaly:
+  enabled: true
+  window_seconds: 60       # rolling window length
+  threshold_rps: 200       # requests per window before anomaly alert fires
+  cooldown_seconds: 300    # min seconds between repeated alerts for same key
 
 alerting:
   webhook_url: "https://discord.com/api/webhooks/1479175905346850986/ZawGyWlH1a3PTRHBK4FSQN9qWuQ8Dey4NJmA4OGNYnCJKhbsPpZN26_Cs9dydEvn2_Br"     # Discord/Slack/generic POST URL — empty = disabled
@@ -47,6 +69,18 @@ filter:
   reload_interval: 60                        # seconds between hot-reloads of filter files
   whitelist_mode: false                      # true = only allow domains in allowlist
   bypass_domains: []                         # extra bypass domains (in addition to allowlist file)
+  content_types:
+    block: []           # MIME substrings to block, e.g. ["video/", "audio/", "application/octet-stream"]
+
+categorizer:
+  enabled: true
+  block_categories: []   # e.g. ["adult", "gambling", "malware", "social", "ads", "piracy"]
+  rules: []              # manual domain → category: [{domain: "*.casino.com", category: gambling}]
+  external:
+    enabled: false       # set true to call an external categorization API
+    url: ""              # POST endpoint that accepts {"domain": "..."} and returns {"category": "..."}
+    timeout: 3.0
+    cache_ttl: 3600
 
 logging:
   level: "DEBUG"
@@ -67,6 +101,11 @@ rewrite:
   response:
     - {header: "Server", action: remove}             # hide server fingerprint
     - {header: "X-Powered-By", action: remove}
+  body: []
+    # Regex find/replace rules applied to response bodies (text/* content only).
+    # Examples:
+    #   - {pattern: "foo", replacement: "bar"}
+    #   - {pattern: "(?i)old name", replacement: "New Name", content_types: ["text/html"]}
 
 # Per-IP bandwidth throttling (first CIDR match wins; 0 bps = unlimited)
 bandwidth:
@@ -74,3 +113,9 @@ bandwidth:
   # Examples:
   #   - {cidr: "10.0.0.0/8",  bps: 5242880}   # 5 MB/s for LAN
   #   - {cidr: "0.0.0.0/0",   bps: 1048576}   # 1 MB/s for everyone else
+
+# Plugin system — list of Python file paths to load as request/response handlers
+plugins: []
+  # Examples:
+  #   - plugins/my_filter.py
+  #   - /opt/jarvis/plugins/analytics.py

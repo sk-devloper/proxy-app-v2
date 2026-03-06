@@ -170,3 +170,125 @@ class AdvancedCache:
             "size_bytes": total_size,
             "total_hits": total_hits,
         }
+
+
+class RedisCache(AdvancedCache):
+    """Redis-backed HTTP cache with the same interface as AdvancedCache.
+
+    Falls back to in-memory storage if Redis is unavailable or the
+    ``redis`` / ``aioredis`` package is not installed.
+
+    Config::
+
+        cache:
+          backend: redis
+          redis_url: "redis://localhost:6379/0"
+          redis_prefix: "jarvis:cache:"   # key namespace
+          redis_ttl: 36000                # seconds (fallback TTL for Redis keys)
+    """
+
+    def __init__(
+        self,
+        max_size: int = CACHE_MAX_SIZE,
+        ttl: int = CACHE_TTL,
+        redis_url: str = "redis://localhost:6379/0",
+        redis_prefix: str = "jarvis:cache:",
+    ):
+        super().__init__(max_size=max_size, ttl=ttl)
+        self._redis_url    = redis_url
+        self._prefix       = redis_prefix
+        self._redis        = None   # set by connect()
+        self._redis_ok     = False
+
+    async def connect(self) -> None:
+        """Attempt to connect to Redis; fall back to in-memory on failure."""
+        try:
+            import redis.asyncio as aioredis  # type: ignore[import]
+            client = aioredis.from_url(self._redis_url, decode_responses=False)
+            await client.ping()
+            self._redis   = client
+            self._redis_ok = True
+            import logging
+            logging.getLogger("JARVIS.cache").info(
+                "Redis cache connected: %s", self._redis_url
+            )
+        except ImportError:
+            import logging
+            logging.getLogger("JARVIS.cache").warning(
+                "redis package not installed — falling back to in-memory cache. "
+                "Install with: pip install redis"
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger("JARVIS.cache").warning(
+                "Redis connection failed (%s) — falling back to in-memory cache.", exc
+            )
+
+    async def get(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+    ) -> Optional[CacheEntry]:
+        if not self._redis_ok:
+            return await super().get(method, url, headers)
+
+        key = self._prefix + self._make_key(method, url, headers)
+        try:
+            raw = await self._redis.get(key)
+            if raw is None:
+                return None
+            import pickle as _pickle
+            entry: CacheEntry = _pickle.loads(raw)
+            entry.hit_count += 1
+            entry.last_access = time.time()
+            # Refresh TTL in Redis
+            await self._redis.expire(key, int(self._effective_ttl(entry.headers)))
+            return entry
+        except Exception:
+            return await super().get(method, url, headers)
+
+    async def set(
+        self,
+        method: str,
+        url: str,
+        request_headers: Dict[str, str],
+        status_code: int,
+        response_headers: Dict[str, str],
+        body: bytes,
+    ) -> None:
+        if not self._redis_ok:
+            return await super().set(
+                method, url, request_headers, status_code, response_headers, body
+            )
+
+        if not self._is_cacheable(method, status_code, response_headers, request_headers):
+            return
+
+        storable_headers = {
+            k: v for k, v in response_headers.items()
+            if k.lower() not in _HOP_BY_HOP
+        }
+        ttl    = self._effective_ttl(response_headers)
+        key    = self._prefix + self._make_key(method, url, request_headers)
+        entry  = CacheEntry(
+            url=url,
+            status_code=status_code,
+            headers=storable_headers,
+            body=body,
+            timestamp=time.time(),
+            size=len(body),
+            ttl=ttl,
+        )
+        try:
+            import pickle as _pickle
+            await self._redis.setex(key, int(ttl), _pickle.dumps(entry))
+        except Exception:
+            await super().set(
+                method, url, request_headers, status_code, response_headers, body
+            )
+
+    def get_stats(self) -> dict:
+        base = super().get_stats()
+        base["backend"] = "redis" if self._redis_ok else "memory"
+        return base

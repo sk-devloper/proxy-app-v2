@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 import time
 from collections import deque
 from typing import TYPE_CHECKING, Set
@@ -697,11 +698,36 @@ class WebUIServer:
         self._token: str = _cfg.get("web_ui", "token", "") or ""
 
     async def start(self) -> asyncio.AbstractServer:
+        ssl_ctx: ssl.SSLContext | None = None
+        import config as _cfg2
+        _tls = _cfg2.load().get("web_ui", {}).get("tls", {})
+        if _tls.get("enabled", False):
+            cert = _tls.get("cert", "")
+            key  = _tls.get("key", "")
+            if cert and key:
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ssl_ctx.load_cert_chain(cert, key)
+                log.info("Web UI TLS enabled (cert=%s)", cert)
+            else:
+                # Auto-generate self-signed cert via ssl_manager if present
+                try:
+                    from ssl_manager import SSLCertificateManager
+                    _mgr = SSLCertificateManager()
+                    _cert_path, _key_path = _mgr.get_ca_cert_path(), _mgr.get_ca_key_path()
+                    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    ssl_ctx.load_cert_chain(_cert_path, _key_path)
+                    log.info("Web UI TLS: using proxy CA cert")
+                except Exception as exc:
+                    log.warning("Web UI TLS requested but cert load failed: %s", exc)
+
         server = await asyncio.start_server(
-            self._handle, self.host, self.port, reuse_address=True
+            self._handle, self.host, self.port,
+            reuse_address=True,
+            ssl=ssl_ctx,
         )
+        scheme = "https" if ssl_ctx else "http"
         asyncio.create_task(self._broadcast_loop())
-        log.info("Web UI at http://%s:%d", self.host, self.port)
+        log.info("Web UI at %s://%s:%d", scheme, self.host, self.port)
         return server
 
     # ── auth helper ───────────────────────────────────────────────────────────
@@ -802,6 +828,34 @@ class WebUIServer:
                 await self._handle_block_api(method, path, reader, writer)
             elif path == "/api/v1/har":
                 await self._handle_har_export(writer)
+            elif path == "/openapi.yaml":
+                await self._serve_openapi_spec(writer)
+            elif path == "/docs":
+                # Redirect to Swagger UI (CDN-hosted) pointing at our spec
+                import urllib.parse as _uparse
+                spec_url = f"http://{req_headers.get('host', 'localhost')}/openapi.yaml"
+                sw_url   = f"https://petstore.swagger.io/?url={_uparse.quote(spec_url)}"
+                writer.write(
+                    f"HTTP/1.1 302 Found\r\nLocation: {sw_url}\r\nContent-Length: 0\r\n\r\n".encode()
+                )
+                await writer.drain()
+            # ── Extended management API ──────────────────────────────────────
+            elif path == "/api/v1/blocklist":
+                await self._handle_blocklist(method, reader, writer)
+            elif path.startswith("/api/v1/blocklist/"):
+                domain = path[len("/api/v1/blocklist/"):]
+                await self._handle_blocklist_item(method, domain, writer)
+            elif path == "/api/v1/allowlist":
+                await self._handle_allowlist(method, reader, writer)
+            elif path.startswith("/api/v1/allowlist/"):
+                domain = path[len("/api/v1/allowlist/"):]
+                await self._handle_allowlist_item(method, domain, writer)
+            elif path == "/api/v1/filters":
+                await self._handle_filters_config(method, reader, writer)
+            elif path == "/api/v1/security":
+                await self._handle_security_config(method, reader, writer)
+            elif path == "/api/v1/bandwidth":
+                await self._handle_bandwidth_api(method, reader, writer)
             else:
                 writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                 await writer.drain()
@@ -854,6 +908,15 @@ class WebUIServer:
             "# HELP jarvis_uptime_seconds Proxy uptime in seconds",
             "# TYPE jarvis_uptime_seconds gauge",
             f"jarvis_uptime_seconds {uptime:.1f}",
+            "# HELP jarvis_websocket_connections_total WebSocket upgrades detected",
+            "# TYPE jarvis_websocket_connections_total counter",
+            f"jarvis_websocket_connections_total {s.websocket_connections}",
+            "# HELP jarvis_websocket_frames_in_total WS frames received from clients",
+            "# TYPE jarvis_websocket_frames_in_total counter",
+            f"jarvis_websocket_frames_in_total {s.websocket_frames_in}",
+            "# HELP jarvis_websocket_frames_out_total WS frames sent to clients",
+            "# TYPE jarvis_websocket_frames_out_total counter",
+            f"jarvis_websocket_frames_out_total {s.websocket_frames_out}",
         ]
         return "\n".join(lines) + "\n"
 
@@ -923,6 +986,237 @@ class WebUIServer:
                 b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
                 + f"Content-Length: {len(resp)}\r\n\r\n".encode() + resp
             )
+        await writer.drain()
+
+    # ── Extended management REST API ──────────────────────────────────────────
+
+    async def _serve_openapi_spec(self, writer: asyncio.StreamWriter) -> None:
+        """Serve openapi.yaml from disk."""
+        import os
+        spec_path = os.path.join(os.path.dirname(__file__), "openapi.yaml")
+        try:
+            with open(spec_path, "rb") as f:
+                body = f.read()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/yaml\r\n"
+                b"Access-Control-Allow-Origin: *\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+        except FileNotFoundError:
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+
+    def _json_ok(self, data: object) -> bytes:
+        body = json.dumps(data, separators=(",", ":")).encode()
+        return (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+
+    def _json_created(self, data: object) -> bytes:
+        body = json.dumps(data, separators=(",", ":")).encode()
+        return (
+            b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+
+    async def _read_json(self, reader: asyncio.StreamReader) -> dict:
+        raw = await asyncio.wait_for(reader.read(65536), timeout=5)
+        return json.loads(raw)
+
+    async def _handle_blocklist(
+        self, method: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """GET /api/v1/blocklist — list all blocked domains.
+        POST /api/v1/blocklist — add domain(s)  {"domains": ["example.com"]}"""
+        if method == "GET":
+            domains = sorted(self.proxy.filter_mgr._blocked_domains)
+            writer.write(self._json_ok({"domains": domains, "count": len(domains)}))
+        elif method == "POST":
+            try:
+                data = await self._read_json(reader)
+                added = []
+                for d in data.get("domains", [data.get("domain", "")]):
+                    d = d.strip()
+                    if d:
+                        self.proxy.add_blocked_domain(d)
+                        added.append(d)
+                writer.write(self._json_created({"added": added}))
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode()
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+                             + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        else:
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+
+    async def _handle_blocklist_item(
+        self, method: str, domain: str, writer: asyncio.StreamWriter
+    ) -> None:
+        """DELETE /api/v1/blocklist/{domain}"""
+        if method == "DELETE":
+            self.proxy.remove_blocked_domain(domain)
+            writer.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        else:
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+
+    async def _handle_allowlist(
+        self, method: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """GET /api/v1/allowlist — list allowed/bypass domains.
+        POST /api/v1/allowlist — add domain(s)  {"domains": ["safe.com"]}"""
+        if method == "GET":
+            domains = sorted(self.proxy.filter_mgr._allowed_domains)
+            writer.write(self._json_ok({"domains": domains, "count": len(domains)}))
+        elif method == "POST":
+            try:
+                data = await self._read_json(reader)
+                added = []
+                for d in data.get("domains", [data.get("domain", "")]):
+                    d = d.strip().lower().lstrip("*.")
+                    if d:
+                        self.proxy.filter_mgr._allowed_domains.add(d)
+                        added.append(d)
+                writer.write(self._json_created({"added": added}))
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode()
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+                             + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        else:
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+
+    async def _handle_allowlist_item(
+        self, method: str, domain: str, writer: asyncio.StreamWriter
+    ) -> None:
+        """DELETE /api/v1/allowlist/{domain}"""
+        if method == "DELETE":
+            self.proxy.filter_mgr._allowed_domains.discard(domain.lower().lstrip("*."))
+            writer.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        else:
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+
+    async def _handle_filters_config(
+        self, method: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """GET /api/v1/filters — current filter settings.
+        PATCH /api/v1/filters — update settings {"whitelist_mode": true}"""
+        if method == "GET":
+            writer.write(self._json_ok({
+                "whitelist_mode": self.proxy.stats.whitelist_mode,
+                "blocked_count":  len(self.proxy.filter_mgr._blocked_domains),
+                "allowed_count":  len(self.proxy.filter_mgr._allowed_domains),
+                "blocked_content_types": self.proxy._blocked_content_types,
+            }))
+        elif method in ("POST", "PATCH"):
+            try:
+                data = await self._read_json(reader)
+                if "whitelist_mode" in data:
+                    self.proxy.stats.whitelist_mode = bool(data["whitelist_mode"])
+                if "blocked_content_types" in data:
+                    self.proxy._blocked_content_types = [
+                        t.lower() for t in data["blocked_content_types"]
+                    ]
+                writer.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode()
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+                             + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        else:
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+
+    async def _handle_security_config(
+        self, method: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """GET /api/v1/security — current security settings.
+        PATCH /api/v1/security — update {"force_https": true}"""
+        if method == "GET":
+            import ipaddress as _ip
+            writer.write(self._json_ok({
+                "force_https":      self.proxy._force_https,
+                "client_allowlist": [str(n) for n in self.proxy._client_allowlist],
+                "client_denylist":  [str(n) for n in self.proxy._client_denylist],
+                "anomaly_enabled":  self.proxy._anomaly_enabled,
+                "anomaly_threshold_rps": (
+                    self.proxy.anomaly_detector.threshold_rps
+                    if self.proxy.anomaly_detector else None
+                ),
+            }))
+        elif method in ("POST", "PATCH"):
+            try:
+                import ipaddress as _ip
+                data = await self._read_json(reader)
+                if "force_https" in data:
+                    self.proxy._force_https = bool(data["force_https"])
+                if "client_allowlist" in data:
+                    self.proxy._client_allowlist = [
+                        _ip.ip_network(c, strict=False)
+                        for c in data["client_allowlist"]
+                    ]
+                if "client_denylist" in data:
+                    self.proxy._client_denylist = [
+                        _ip.ip_network(c, strict=False)
+                        for c in data["client_denylist"]
+                    ]
+                writer.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode()
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+                             + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        else:
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+
+    async def _handle_bandwidth_api(
+        self, method: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """GET /api/v1/bandwidth — list bandwidth rules.
+        POST /api/v1/bandwidth — add rule  {"cidr": "10.0.0.0/8", "bps": 5242880}
+        DELETE /api/v1/bandwidth — remove rule {"cidr": "10.0.0.0/8"}"""
+        if method == "GET":
+            rules = [
+                {"cidr": str(r.network), "bps": r.bps}
+                for r in self.proxy.bw_policy._rules
+            ]
+            writer.write(self._json_ok({"rules": rules}))
+        elif method == "POST":
+            try:
+                import ipaddress as _ip
+                from bw_policy import BWRule
+                data = await self._read_json(reader)
+                cidr = data["cidr"]
+                bps  = int(data.get("bps", 0))
+                net  = _ip.ip_network(cidr, strict=False)
+                # Prepend so new rules take priority
+                self.proxy.bw_policy._rules.insert(0, BWRule(network=net, bps=bps))
+                writer.write(self._json_created({"cidr": str(net), "bps": bps}))
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode()
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+                             + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        elif method == "DELETE":
+            try:
+                import ipaddress as _ip
+                data = await self._read_json(reader)
+                cidr = data["cidr"]
+                net  = _ip.ip_network(cidr, strict=False)
+                self.proxy.bw_policy._rules = [
+                    r for r in self.proxy.bw_policy._rules if r.network != net
+                ]
+                writer.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode()
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+                             + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        else:
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
         await writer.drain()
 
     # ── SSE ───────────────────────────────────────────────────────────────────
@@ -1013,6 +1307,9 @@ class WebUIServer:
             "total_errors":         s.total_errors,
             "https_requests":       s.https_requests,
             "http_requests":        s.http_requests,
+            "websocket_connections": s.websocket_connections,
+            "websocket_frames_in":  s.websocket_frames_in,
+            "websocket_frames_out": s.websocket_frames_out,
             "active_connections":   s.active_connections,
             "peak_connections":     s.peak_connections,
             "unique_clients":       len(s.unique_clients),

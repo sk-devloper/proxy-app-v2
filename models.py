@@ -142,6 +142,7 @@ class ConnectionMetrics:
     request_headers: Dict[str, str] = field(default_factory=dict)
     response_headers: Dict[str, str] = field(default_factory=dict)
     is_https: bool = False
+    request_id: Optional[str] = None
 
 
 @dataclass
@@ -158,6 +159,9 @@ class ProxyStats:
     peak_connections: int = 0
     https_requests: int = 0
     http_requests: int = 0
+    websocket_connections: int = 0   # cumulative WS upgrades detected
+    websocket_frames_in: int = 0     # frames received from clients
+    websocket_frames_out: int = 0    # frames sent to clients
 
     # Cache stats
     cache_hits: int = 0

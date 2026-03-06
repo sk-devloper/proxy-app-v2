@@ -10,6 +10,7 @@ import ssl
 import base64
 import sys
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict
 from contextlib import asynccontextmanager
@@ -27,11 +28,12 @@ from models import (
     BUFFER_SIZE, DEFAULT_TIMEOUT, MAX_HEADER_SIZE, STATS_UPDATE_INTERVAL,
 )
 from ssl_manager import SSLCertificateManager
-from cache import AdvancedCache
+from cache import AdvancedCache, RedisCache
 from security import SecurityAnalyzer, TrafficInspector
 from geoip import GeoIPResolver
 from database import DatabaseLogger
 from filter_manager import FilterManager
+from middleware import run_request_checks
 
 class JARVISProxy:
     """Iron Man's J.A.R.V.I.S. - Just A Rather Very Intelligent System Proxy"""
@@ -53,7 +55,19 @@ class JARVISProxy:
             self.ssl_manager = None
 
         # Advanced components
-        self.cache = AdvancedCache()
+        _cache_cfg = cfg.load().get("cache", {})
+        if _cache_cfg.get("backend", "memory") == "redis":
+            self.cache: AdvancedCache = RedisCache(
+                max_size   = _cache_cfg.get("max_size", 10000),
+                ttl        = _cache_cfg.get("ttl", 36000),
+                redis_url  = _cache_cfg.get("redis_url", "redis://localhost:6379/0"),
+                redis_prefix = _cache_cfg.get("redis_prefix", "jarvis:cache:"),
+            )
+        else:
+            self.cache = AdvancedCache(
+                max_size = _cache_cfg.get("max_size", 10000),
+                ttl      = _cache_cfg.get("ttl", 36000),
+            )
         self.security = SecurityAnalyzer()
         self.inspector = TrafficInspector()
         self.geoip = GeoIPResolver()
@@ -72,7 +86,7 @@ class JARVISProxy:
 
         # DNS cache
         self.dns_cache: Dict[str, Tuple[DNSInfo, float]] = {}
-        self.dns_cache_ttl = 300
+        self.dns_cache_ttl = cfg.get("proxy", "dns_cache_ttl", 300)
         self._dns_pending: Dict[str, asyncio.Future] = {}  # deduplicates in-flight lookups
 
         # Bandwidth throttling
@@ -86,6 +100,24 @@ class JARVISProxy:
         from rewrite import HeaderRewriter
         self.header_rewriter = HeaderRewriter.from_config(cfg.load())
 
+        # Anomaly detection
+        from anomaly import AnomalyDetector
+        _anomaly_cfg = cfg.load().get("anomaly", {})
+        self._anomaly_enabled = bool(_anomaly_cfg.get("enabled", True))
+        self.anomaly_detector = AnomalyDetector.from_config(cfg.load()) if self._anomaly_enabled else None
+
+        # DNS-over-HTTPS resolver (optional; falls back to system DNS)
+        from dns_resolver import DoHResolver
+        self.doh_resolver = DoHResolver.from_config(cfg.load())
+
+        # Plugin system
+        from plugin_manager import PluginManager
+        self.plugin_mgr = PluginManager.from_config(cfg.load())
+
+        # Category-based URL filter
+        from categorizer import CategoryFilter
+        self.category_filter = CategoryFilter.from_config(cfg.load())
+
         # Client IP allowlist / denylist (CIDR lists)
         import ipaddress as _ipaddress
         _sec_cfg = cfg.load().get("security", {})
@@ -96,6 +128,15 @@ class JARVISProxy:
         self._client_denylist = [
             _ipaddress.ip_network(c, strict=False)
             for c in _sec_cfg.get("client_denylist", [])
+        ]
+
+        # Force HTTP→HTTPS upgrade (redirect plain HTTP requests to HTTPS)
+        self._force_https: bool = bool(_sec_cfg.get("force_https", False))
+
+        # Content-Type blocking (list of MIME type substrings, e.g. ["video/", "audio/"])
+        _filter_cfg2 = cfg.load().get("filters", {})
+        self._blocked_content_types: List[str] = [
+            t.lower() for t in _filter_cfg2.get("content_types", {}).get("block", [])
         ]
 
         # Proxy authentication (empty string = disabled)
@@ -433,11 +474,19 @@ class JARVISProxy:
 
         start = time.time()
         try:
-            infos = await asyncio.wait_for(
-                loop.getaddrinfo(host, None, family=socket.AF_UNSPEC),
-                timeout=5.0
-            )
-            addresses = list(set(info[4][0] for info in infos))
+            # Try DNS-over-HTTPS first if configured
+            addresses: list[str] = []
+            if self.doh_resolver:
+                addresses = await self.doh_resolver.resolve(host)
+
+            # Fall back to system DNS when DoH is disabled or returns nothing
+            if not addresses:
+                infos = await asyncio.wait_for(
+                    loop.getaddrinfo(host, None, family=socket.AF_UNSPEC),
+                    timeout=5.0
+                )
+                addresses = list(set(info[4][0] for info in infos))
+
             end = time.time()
 
             is_ipv6 = any(':' in addr for addr in addresses)
@@ -516,6 +565,85 @@ class JARVISProxy:
             self.logger.error(f"Error in pipe_stream: {e}")
 
         # Flush whatever is left in the write buffer
+        try:
+            await writer.drain()
+        except Exception:
+            pass
+        return total_bytes
+
+    async def pipe_stream_ws(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        direction: str = "in",
+        client_ip: str = "",
+    ) -> int:
+        """Pipe WebSocket tunnel data while counting frames.
+
+        Parses WebSocket frame headers to increment per-direction frame counters
+        in ProxyStats without buffering payload data.
+        """
+        total_bytes = 0
+        buf = bytearray()
+        try:
+            while True:
+                chunk = await reader.read(BUFFER_SIZE)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                total_bytes += len(chunk)
+                buf.extend(chunk)
+
+                # Parse as many WS frames as we can from the buffer (best-effort)
+                pos = 0
+                while len(buf) - pos >= 2:
+                    b0, b1 = buf[pos], buf[pos + 1]
+                    masked     = bool(b1 & 0x80)
+                    payload_len = b1 & 0x7F
+                    hdr_size    = 2
+                    if payload_len == 126:
+                        if len(buf) - pos < 4:
+                            break
+                        payload_len = int.from_bytes(buf[pos+2:pos+4], "big")
+                        hdr_size = 4
+                    elif payload_len == 127:
+                        if len(buf) - pos < 10:
+                            break
+                        payload_len = int.from_bytes(buf[pos+2:pos+10], "big")
+                        hdr_size = 10
+                    if masked:
+                        hdr_size += 4  # masking key
+                    frame_size = hdr_size + payload_len
+                    if len(buf) - pos < frame_size:
+                        break
+                    # Count the frame
+                    opcode = b0 & 0x0F
+                    if opcode not in (0x8,):  # skip connection-close
+                        if direction == "in":
+                            self.stats.websocket_frames_in += 1
+                        else:
+                            self.stats.websocket_frames_out += 1
+                    pos += frame_size
+
+                # Keep only the unconsumed part
+                if pos:
+                    buf = buf[pos:]
+                if len(buf) > 16 * 1024 * 1024:
+                    buf.clear()  # safety: don't accumulate unboundedly
+
+                bw = self.bw_policy.get_limit(client_ip)
+                if bw > 0:
+                    await asyncio.sleep(len(chunk) / bw)
+                else:
+                    try:
+                        if writer.transport.get_write_buffer_size() > BUFFER_SIZE * 8:
+                            await writer.drain()
+                    except AttributeError:
+                        pass
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as exc:
+            self.logger.debug(f"WS pipe error: {exc}")
         try:
             await writer.drain()
         except Exception:
@@ -652,6 +780,12 @@ class JARVISProxy:
             if target_host in self.stats.blocked_domains:
                 raise Exception(f"Domain blocked: {target_host}")
 
+            # Category-based filtering for CONNECT tunnels
+            if self.category_filter:
+                _cat = await self.category_filter.categorize_with_external(target_host)
+                if self.category_filter.is_blocked(_cat):
+                    raise Exception(f"Domain blocked by category '{_cat}': {target_host}")
+
             if self.stats.whitelist_mode and target_host not in self.stats.allowed_domains:
                 raise Exception(f"Domain not in whitelist: {target_host}")
 
@@ -689,6 +823,7 @@ class JARVISProxy:
                         self.logger.info(
                             f"WebSocket detected: {client_ip} -> {target_host}:{target_port}"
                         )
+                        self.stats.websocket_connections += 1
                         asyncio.create_task(self.db.log_connection(
                             client_ip, target_host, target_port, 0, 0, 0,
                         ))
@@ -696,12 +831,20 @@ class JARVISProxy:
                     remote_writer.write(_first_chunk)
                     await remote_writer.drain()
 
-                # Bidirectional pipe
-                results = await asyncio.gather(
-                    self.pipe_stream(client_reader, remote_writer, throttle=True, client_ip=client_ip),
-                    self.pipe_stream(remote_reader, client_writer, throttle=True, client_ip=client_ip),
-                    return_exceptions=True
-                )
+                # Bidirectional pipe — use WS-aware pipe for WebSocket tunnels
+                _is_ws = b"upgrade: websocket" in _first_chunk.lower() if _first_chunk else False
+                if _is_ws:
+                    results = await asyncio.gather(
+                        self.pipe_stream_ws(client_reader, remote_writer, direction="in",  client_ip=client_ip),
+                        self.pipe_stream_ws(remote_reader, client_writer, direction="out", client_ip=client_ip),
+                        return_exceptions=True
+                    )
+                else:
+                    results = await asyncio.gather(
+                        self.pipe_stream(client_reader, remote_writer, throttle=True, client_ip=client_ip),
+                        self.pipe_stream(remote_reader, client_writer, throttle=True, client_ip=client_ip),
+                        return_exceptions=True
+                    )
 
                 bytes_sent     = results[0] if isinstance(results[0], int) else 0
                 bytes_received = results[1] if isinstance(results[1], int) else 0
@@ -803,6 +946,22 @@ class JARVISProxy:
 
         is_https = parsed.scheme == "https"
 
+        # Forced HTTPS upgrade: redirect plain HTTP to HTTPS
+        if not is_https and self._force_https:
+            https_url = full_url.replace("http://", "https://", 1)
+            redirect = (
+                f"HTTP/1.1 307 Temporary Redirect\r\n"
+                f"Location: {https_url}\r\n"
+                f"Content-Length: 0\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            client_writer.write(redirect.encode())
+            await client_writer.drain()
+            self.stats.active_connections -= 1
+            return
+
+        request_id = str(uuid.uuid4())
+
         metrics = ConnectionMetrics(
             type="HTTP",
             host=host,
@@ -815,32 +974,15 @@ class JARVISProxy:
             client_ip=client_ip,
             user_agent=user_agent,
             request_headers=headers_dict,
-            is_https=is_https
+            is_https=is_https,
+            request_id=request_id,
         )
 
         try:
-            # Security checks
-            sec_level, sec_reason = self.security.analyze_url(full_url, host)
-            header_sec_level, header_sec_reason = self.security.analyze_headers(headers_dict)
+            # Security, filter, category, rate-limit, and anomaly checks
+            await run_request_checks(self, client_ip, host, full_url, method, headers_dict)
 
-            if header_sec_level.value > sec_level.value:
-                sec_level = header_sec_level
-                sec_reason = header_sec_reason
-
-            metrics.security_level = sec_level
-
-            if sec_level == SecurityLevel.MALICIOUS:
-                raise Exception(f"Malicious request blocked: {sec_reason}")
-
-            if self.filter_mgr.is_blocked(host) and not self.filter_mgr.is_bypassed(host):
-                raise Exception(f"Domain blocked: {host}")
-
-            if self.stats.whitelist_mode and not self.filter_mgr.is_bypassed(host) \
-                    and host not in self.stats.allowed_domains:
-                raise Exception(f"Domain not in whitelist: {host}")
-
-            if not self.security.check_rate_limit(client_ip):
-                raise Exception(f"Rate limit exceeded for {client_ip}")
+            metrics.security_level = self.security.analyze_url(full_url, host)[0]
 
             # Check cache
             cache_entry = await self.cache.get(method, full_url, headers_dict)
@@ -911,8 +1053,20 @@ class JARVISProxy:
                         _fwd_dict[k.strip()] = v.strip()
                 _fwd_dict["Connection"] = "close"
 
+                # Inject correlation ID — preserve existing if upstream already set one
+                if "X-Request-ID" not in _fwd_dict:
+                    _fwd_dict["X-Request-ID"] = request_id
+
                 # Apply request rewrite rules
                 _fwd_dict = self.header_rewriter.apply_request(_fwd_dict)
+
+                # Run plugin on_request hooks
+                if self.plugin_mgr.has_request_hooks:
+                    _plugin_req = await self.plugin_mgr.run_request_hooks(
+                        method, full_url, _fwd_dict
+                    )
+                    method      = _plugin_req["method"]
+                    _fwd_dict   = _plugin_req["headers"]
 
                 new_request = f"{method} {path} HTTP/1.1\r\n"
                 new_request += "\r\n".join(f"{k}: {v}" for k, v in _fwd_dict.items()) + "\r\n\r\n"
@@ -974,9 +1128,8 @@ class JARVISProxy:
                 status_code = 0
                 response_headers = {}
 
-                # Read and forward status line
+                # Read and forward status line (buffered — forwarded after header checks)
                 status_line = await remote_reader.readuntil(b"\r\n")
-                client_writer.write(status_line)
 
                 try:
                     parts = status_line.decode(errors="ignore").split()
@@ -1001,18 +1154,37 @@ class JARVISProxy:
                         _resp_dict[_rk] = _rv
                         response_headers[_rk.lower()] = _rv
 
+                # Content-Type blocking — check before sending anything to client
+                if self._blocked_content_types:
+                    _ct = response_headers.get("content-type", "").lower()
+                    for _blocked in self._blocked_content_types:
+                        if _blocked in _ct:
+                            raise Exception(f"Content-Type blocked: {_ct}")
+
                 # Apply response rewrite rules
                 _resp_dict = self.header_rewriter.apply_response(_resp_dict)
 
                 # Re-build response_headers from rewritten dict
                 response_headers = {k.lower(): v for k, v in _resp_dict.items()}
 
-                # Forward rewritten headers to client
-                for _rk, _rv in _resp_dict.items():
-                    client_writer.write(f"{_rk}: {_rv}\r\n".encode())
-                client_writer.write(b"\r\n")
+                # Inject X-Request-ID into response so clients can trace it
+                _resp_dict["X-Request-ID"] = request_id
 
-                await client_writer.drain()
+                # Determine if response body should be buffered for rewriting
+                _ct_header = response_headers.get("content-type", "")
+                will_rewrite_body = (
+                    self.header_rewriter.has_body_rules
+                    and not response_headers.get("content-encoding")
+                    and any(r.applies_to(_ct_header) for r in self.header_rewriter._body_rules)
+                )
+
+                if not will_rewrite_body:
+                    # Fast path: send status line + headers immediately, stream body
+                    client_writer.write(status_line)
+                    for _rk, _rv in _resp_dict.items():
+                        client_writer.write(f"{_rk}: {_rv}\r\n".encode())
+                    client_writer.write(b"\r\n")
+                    await client_writer.drain()
 
                 # ── Body streaming ────────────────────────────────────────────
                 # Strategy depends on how the server signals body length:
@@ -1037,6 +1209,7 @@ class JARVISProxy:
                 body_parts: list = []
                 body_size   = 0
                 sampled     = 0
+                _rewrite_buf: list[bytes] = []  # used when will_rewrite_body
 
                 def _store(data: bytes):
                     """Accumulate data for cache / inspection; do NOT write to socket."""
@@ -1049,7 +1222,10 @@ class JARVISProxy:
                         sampled += len(data)
 
                 async def _send(data: bytes):
-                    """Write to client and drain lazily."""
+                    """Write to client (or buffer if body rewriting is active)."""
+                    if will_rewrite_body:
+                        _rewrite_buf.append(data)
+                        return
                     client_writer.write(data)
                     try:
                         if client_writer.transport.get_write_buffer_size() > _DRAIN_HWM:
@@ -1162,6 +1338,12 @@ class JARVISProxy:
                 metrics.content_type = analysis["content_type"]
                 metrics.compressed   = analysis["compressed"]
 
+                # Run plugin on_response hooks
+                if self.plugin_mgr.has_response_hooks:
+                    await self.plugin_mgr.run_response_hooks(
+                        status_code, response_headers, sample[:_SAMPLE_MAX]
+                    )
+
                 # Check for threats in response
                 if analysis["threats"]:
                     threat = SecurityThreat(
@@ -1185,6 +1367,20 @@ class JARVISProxy:
                         method, full_url, headers_dict,
                         status_code, response_headers, sample
                     )
+
+                # Body rewrite: apply rules, update Content-Length, flush to client
+                if will_rewrite_body:
+                    rewritten = self.header_rewriter.apply_body(
+                        b"".join(_rewrite_buf), _ct_header
+                    )
+                    _resp_dict["Content-Length"] = str(len(rewritten))
+                    _resp_dict.pop("Transfer-Encoding", None)
+                    client_writer.write(status_line)
+                    for _rk, _rv in _resp_dict.items():
+                        client_writer.write(f"{_rk}: {_rv}\r\n".encode())
+                    client_writer.write(b"\r\n")
+                    client_writer.write(rewritten)
+                    await client_writer.drain()
 
                 self.stats.total_bytes_sent += len(new_request.encode())
 
@@ -1626,6 +1822,11 @@ class JARVISProxy:
         from web_ui import WebUIServer
 
         self.running = True
+
+        # Connect Redis cache if configured
+        if isinstance(self.cache, RedisCache):
+            await self.cache.connect()
+
         save_task = asyncio.create_task(self.auto_save_stats())
         perf_task = asyncio.create_task(self.perf_snapshot_task())
         bw_task   = asyncio.create_task(self.bandwidth_tracker_task())
